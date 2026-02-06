@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 continue_session = True
 active_proc = None  # Currently running Claude subprocess
+sent_message_ids: list[int] = []  # Track bot-sent messages for clearing
 
 
 async def send_chunks(chat, text: str) -> None:
@@ -37,7 +38,8 @@ async def send_chunks(chat, text: str) -> None:
     if not text:
         return
     for i in range(0, len(text), MAX_MSG_LEN):
-        await chat.send_message(text[i : i + MAX_MSG_LEN], parse_mode=None)
+        msg = await chat.send_message(text[i : i + MAX_MSG_LEN], parse_mode=None)
+        sent_message_ids.append(msg.message_id)
 
 
 def format_tool_use(content_block: dict) -> str:
@@ -46,10 +48,10 @@ def format_tool_use(content_block: dict) -> str:
     inp = content_block.get("input", {})
 
     if name == "Bash":
-        cmd = inp.get("command", "")
         desc = inp.get("description", "")
-        label = f"**{desc}**\n" if desc else ""
-        return f"🔧 Running command:\n{label}`{cmd}`"
+        if desc:
+            return f"**{desc}**"
+        return None
     elif name == "Write":
         path = inp.get("file_path", "")
         return f"📝 Writing file: `{path}`"
@@ -126,7 +128,8 @@ async def run_claude_streaming(prompt: str, chat, reply_to) -> None:
     # After this invocation, always continue
     continue_session = True
 
-    await reply_to.reply_text("⏳ Working on it...")
+    working_msg = await reply_to.reply_text("⏳ Working on it...")
+    sent_message_ids.append(working_msg.message_id)
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -182,8 +185,12 @@ async def run_claude_streaming(prompt: str, chat, reply_to) -> None:
                                 continue
                             # Only send tool use summaries during processing
                             if block.get("type") == "tool_use":
-                                summary = format_tool_use(block)
-                                await send_chunks(chat, summary)
+                                name = block.get("name", "")
+                                # Only notify for Bash commands
+                                if name == "Bash":
+                                    summary = format_tool_use(block)
+                                    if summary:
+                                        await send_chunks(chat, summary)
 
                     elif etype == "result":
                         # Final response text — this is the only text we send
@@ -220,16 +227,28 @@ async def run_claude_streaming(prompt: str, chat, reply_to) -> None:
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start."""
-    await update.message.reply_text(
+    msg = await update.message.reply_text(
         "Hello! I'm a bridge to Claude Code. Send me a message and I'll forward it "
         "to Claude. Use /new to start a fresh session, or /stop to stop what's running."
     )
+    sent_message_ids.append(msg.message_id)
 
 
 async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /new — reset session."""
-    global continue_session
+    """Handle /new — reset session and clear bot messages from chat."""
+    global continue_session, sent_message_ids
     continue_session = False
+
+    chat_id = update.message.chat_id
+    deleted = 0
+    for msg_id in sent_message_ids:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            deleted += 1
+        except Exception:
+            pass  # Message may already be deleted or too old (>48h)
+    sent_message_ids = []
+
     await update.message.reply_text("Session cleared. Next message starts fresh.")
 
 
@@ -237,13 +256,15 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """Handle /stop — kill the running Claude process without resetting the session."""
     global active_proc
     if active_proc is None:
-        await update.message.reply_text("Nothing is running right now.")
+        msg = await update.message.reply_text("Nothing is running right now.")
+        sent_message_ids.append(msg.message_id)
         return
     try:
         active_proc.kill()
     except ProcessLookupError:
         pass
-    await update.message.reply_text("🛑 Stopped.")
+    msg = await update.message.reply_text("🛑 Stopped.")
+    sent_message_ids.append(msg.message_id)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

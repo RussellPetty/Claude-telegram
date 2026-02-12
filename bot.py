@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 continue_session = True
 active_proc = None  # Currently running Claude subprocess
 sent_message_ids: list[int] = []  # Track bot-sent messages for clearing
+user_message_ids: list[int] = []  # Track user messages for clearing
+term_mode = False  # When True, next message runs as shell command
 
 
 async def send_chunks(chat, text: str) -> None:
@@ -225,6 +227,35 @@ async def run_claude_streaming(prompt: str, chat, reply_to) -> None:
             pass
 
 
+async def run_terminal_command(command: str, chat, reply_to) -> None:
+    """Run a shell command and relay output back to the chat."""
+    working_msg = await reply_to.reply_text(f"🖥️ Running: `{command}`", parse_mode="Markdown")
+    sent_message_ids.append(working_msg.message_id)
+
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=WORKING_DIR,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=TIMEOUT)
+        output = stdout.decode("utf-8", errors="replace").strip()
+
+        if not output:
+            output = "(no output)"
+
+        exit_info = f"Exit code: {proc.returncode}"
+        result = f"```\n{output}\n```\n{exit_info}"
+        await send_chunks(chat, result)
+
+    except asyncio.TimeoutError:
+        await send_chunks(chat, "⏰ Command timed out after 5 minutes.")
+        proc.kill()
+    except Exception as e:
+        await send_chunks(chat, f"❌ Error: {e}")
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start."""
     msg = await update.message.reply_text(
@@ -235,21 +266,27 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /new — reset session and clear bot messages from chat."""
-    global continue_session, sent_message_ids
+    """Handle /new — reset session and clear all messages from chat."""
+    global continue_session, sent_message_ids, user_message_ids
     continue_session = False
 
     chat_id = update.message.chat_id
-    deleted = 0
-    for msg_id in sent_message_ids:
+    all_ids = sent_message_ids + user_message_ids
+    for msg_id in all_ids:
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
-            deleted += 1
         except Exception:
             pass  # Message may already be deleted or too old (>48h)
     sent_message_ids = []
+    user_message_ids = []
 
-    await update.message.reply_text("Session cleared. Next message starts fresh.")
+    # Delete the /new command message itself
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    await update.message.reply_text("Hi, how can I help you?")
 
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -267,16 +304,49 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     sent_message_ids.append(msg.message_id)
 
 
+async def term_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /term — next message will be run as a shell command."""
+    global term_mode
+    term_mode = True
+    msg = await update.message.reply_text("🖥️ Term mode active. Send a command to run.")
+    sent_message_ids.append(msg.message_id)
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /status — show current session state."""
+    running = "Yes" if active_proc is not None else "No"
+    session = "Continuing" if continue_session else "Fresh (next message starts new)"
+    mode = "Terminal" if term_mode else "Claude"
+
+    lines = [
+        f"Working dir: `{WORKING_DIR}`",
+        f"Session: {session}",
+        f"Process running: {running}",
+        f"Input mode: {mode}",
+    ]
+    msg = await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    sent_message_ids.append(msg.message_id)
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle plain text messages."""
+    global term_mode
     text = update.message.text
     if not text:
         return
+    user_message_ids.append(update.message.message_id)
+
+    if term_mode:
+        term_mode = False
+        await run_terminal_command(text, update.message.chat, update.message)
+        return
+
     await run_claude_streaming(text, update.message.chat, update.message)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle photo messages — save image, ask Claude to read it."""
+    user_message_ids.append(update.message.message_id)
     photo = update.message.photo[-1]
     file = await photo.get_file()
 
@@ -299,6 +369,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("new", new_command))
     app.add_handler(CommandHandler("stop", stop_command))
+    app.add_handler(CommandHandler("term", term_command))
+    app.add_handler(CommandHandler("status", status_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 

@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Telegram bot that bridges messages to Claude Code CLI with streaming updates."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
 import os
 import uuid
 
-from telegram import Update
+from telegram import ReactionTypeEmoji, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
@@ -33,6 +35,13 @@ active_proc = None  # Currently running Claude subprocess
 sent_message_ids: list[int] = []  # Track bot-sent messages for clearing
 user_message_ids: list[int] = []  # Track user messages for clearing
 term_mode = False  # When True, next message runs as shell command
+stop_requested = False  # Set by /stop so we don't show stderr noise
+
+# Debounce state — collect rapid message chunks before sending to Claude
+pending_text: list[str] = []
+debounce_task: asyncio.Task | None = None
+last_reply_to = None  # The most recent message object for reply threading
+processing_lock = asyncio.Lock()  # Prevent concurrent Claude runs
 
 
 async def send_chunks(chat, text: str) -> None:
@@ -116,7 +125,7 @@ def format_tool_result(event: dict) -> str | None:
 
 async def run_claude_streaming(prompt: str, chat, reply_to) -> None:
     """Run claude with stream-json output, sending updates as separate messages."""
-    global continue_session, active_proc
+    global continue_session, active_proc, stop_requested
 
     cmd = [
         "claude", "-p", prompt,
@@ -130,8 +139,10 @@ async def run_claude_streaming(prompt: str, chat, reply_to) -> None:
     # After this invocation, always continue
     continue_session = True
 
-    working_msg = await reply_to.reply_text("⏳ Working on it...")
-    sent_message_ids.append(working_msg.message_id)
+    try:
+        await reply_to.set_reaction(ReactionTypeEmoji("👍"))
+    except Exception as e:
+        logger.error("Failed to set reaction: %s", e)
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -206,7 +217,7 @@ async def run_claude_streaming(prompt: str, chat, reply_to) -> None:
         # Wait for process to finish
         await proc.wait()
 
-        if proc.returncode != 0:
+        if proc.returncode != 0 and not stop_requested:
             stderr = await proc.stderr.read()
             stderr_text = stderr.decode("utf-8", errors="replace").strip()
             if stderr_text:
@@ -219,6 +230,7 @@ async def run_claude_streaming(prompt: str, chat, reply_to) -> None:
         await chat.send_message(f"❌ Error: {e}")
     finally:
         active_proc = None
+        stop_requested = False
         typing_active = False
         typing_task.cancel()
         try:
@@ -291,11 +303,19 @@ async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /stop — kill the running Claude process without resetting the session."""
-    global active_proc
+    global active_proc, stop_requested, debounce_task, pending_text
+
+    # Cancel any pending debounce so queued chunks don't fire after stop
+    if debounce_task and not debounce_task.done():
+        debounce_task.cancel()
+        debounce_task = None
+    pending_text.clear()
+
     if active_proc is None:
         msg = await update.message.reply_text("Nothing is running right now.")
         sent_message_ids.append(msg.message_id)
         return
+    stop_requested = True
     try:
         active_proc.kill()
     except ProcessLookupError:
@@ -328,9 +348,27 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     sent_message_ids.append(msg.message_id)
 
 
+async def _process_debounced(chat) -> None:
+    """Wait for the debounce window, then send all buffered text to Claude."""
+    global pending_text, last_reply_to
+    await asyncio.sleep(1.5)  # Debounce window — wait for more chunks
+
+    # Grab everything that accumulated and clear the buffer
+    combined = "\n".join(pending_text)
+    reply_to = last_reply_to
+    pending_text = []
+    last_reply_to = None
+
+    if not combined.strip():
+        return
+
+    async with processing_lock:
+        await run_claude_streaming(combined, chat, reply_to)
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle plain text messages."""
-    global term_mode
+    """Handle plain text messages with debounce for chunked inputs."""
+    global term_mode, debounce_task, last_reply_to, pending_text
     text = update.message.text
     if not text:
         return
@@ -341,7 +379,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await run_terminal_command(text, update.message.chat, update.message)
         return
 
-    await run_claude_streaming(text, update.message.chat, update.message)
+    # Buffer the message and (re)start the debounce timer
+    pending_text.append(text)
+    last_reply_to = update.message
+
+    if debounce_task and not debounce_task.done():
+        debounce_task.cancel()
+
+    debounce_task = asyncio.create_task(
+        _process_debounced(update.message.chat)
+    )
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -364,7 +411,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 def main() -> None:
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("new", new_command))
@@ -375,7 +422,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     logger.info("Bot starting...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":

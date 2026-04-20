@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -911,6 +912,35 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await run_claude_streaming(prompt, update.message.chat, update.message, state, thread_id=thread_id)
 
 
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+
+
+async def attach_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /attach <session_id> — attach an existing Claude session to this chat/topic so
+    the next message resumes it via `claude --resume <id>`."""
+    if not is_allowed(update):
+        return
+    state = state_for(update)
+    text = update.message.text or ""
+    parts = text.split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text("Usage: /attach <claude-session-id>")
+        return
+    session_id = parts[1].strip()
+    if not _UUID_RE.match(session_id):
+        await update.message.reply_text(
+            "⚠️ session_id should be a UUID (e.g. 01234567-89ab-cdef-0123-456789abcdef)."
+        )
+        return
+    state.session_id = session_id
+    state.announce_next_session_id = False
+    msg = await update.message.reply_text(
+        f"🔗 Attached Claude session `{session_id}` — next message will resume it.",
+        parse_mode="Markdown",
+    )
+    state.sent_message_ids.append(msg.message_id)
+
+
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /restart — restart the entire bot process."""
     if not is_allowed(update):
@@ -1338,6 +1368,7 @@ def main() -> None:
     app.add_handler(CommandHandler("model", model_command))
     app.add_handler(CommandHandler("codex", codex_command))
     app.add_handler(CommandHandler("homi", homi_command))
+    app.add_handler(CommandHandler("attach", attach_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
